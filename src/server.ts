@@ -2,7 +2,7 @@ import "dotenv/config";
 import express from "express";
 import { createServer } from "http";
 import { WebSocketServer } from "ws";
-import { systemPrompt, userPrompt } from "./prompt";
+import { connectToDatabase, getPrompts } from "./database";
 
 const PORT = Number(process.env.PORT) || 8080;
 const OPENAI_KEY = process.env.OPENAI_API_KEY!;
@@ -15,6 +15,9 @@ const wss = new WebSocketServer({ server });
 // Add middleware for parsing JSON
 app.use(express.json());
 
+// Connect to MongoDB on startup
+connectToDatabase();
+
 // Health check endpoint for Render
 app.get("/health", (req, res) => {
   res.status(200).json({
@@ -22,6 +25,7 @@ app.get("/health", (req, res) => {
     timestamp: new Date().toISOString(),
     service: "resume-builder",
     websocket: "available",
+    database: "connected",
   });
 });
 
@@ -38,41 +42,52 @@ app.get("/", (req, res) => {
 type ClientMsg = { prompt: string };
 type Message = { role: "system" | "user" | "assistant"; content: string };
 
-wss.on("connection", (ws) => {
+wss.on("connection", async (ws) => {
   console.log("🟢 New WebSocket connection established");
 
-  const chatHistory: Message[] = [
-    { role: "system", content: systemPrompt },
-    { role: "user", content: userPrompt },
-  ];
+  try {
+    // Get prompts from MongoDB
+    const { systemPrompt, userPrompt } = await getPrompts();
+    console.log(systemPrompt, userPrompt);
+    const chatHistory: Message[] = [
+      { role: "system", content: systemPrompt },
+      { role: "user", content: userPrompt },
+    ];
 
-  ws.on("message", async (data) => {
-    const { prompt } = JSON.parse(data.toString()) as ClientMsg;
-    if (!prompt?.trim()) return;
+    ws.on("message", async (data) => {
+      const { prompt } = JSON.parse(data.toString()) as ClientMsg;
+      if (!prompt?.trim()) return;
 
-    chatHistory.push({ role: "user", content: prompt });
+      chatHistory.push({ role: "user", content: prompt });
 
-    try {
-      let fullResponse = "";
-      for await (const token of streamFromOpenAI(chatHistory)) {
-        ws.send(token); // send token-by-token
-        fullResponse += token;
+      try {
+        let fullResponse = "";
+        for await (const token of streamFromOpenAI(chatHistory)) {
+          ws.send(token); // send token-by-token
+          fullResponse += token;
+        }
+        chatHistory.push({ role: "assistant", content: fullResponse });
+        ws.send("[DONE]"); // simple sentinel
+      } catch (err) {
+        console.error("Error in WebSocket message handling:", err);
+        ws.send(`[ERROR] ${(err as Error).message}`);
       }
-      chatHistory.push({ role: "assistant", content: fullResponse });
-      ws.send("[DONE]"); // simple sentinel
-    } catch (err) {
-      console.error("Error in WebSocket message handling:", err);
-      ws.send(`[ERROR] ${(err as Error).message}`);
-    }
-  });
+    });
 
-  ws.on("close", () => {
-    console.log("🔴 WebSocket connection closed");
-  });
+    ws.on("close", () => {
+      console.log("🔴 WebSocket connection closed");
+    });
 
-  ws.on("error", (error) => {
-    console.error("WebSocket error:", error);
-  });
+    ws.on("error", (error) => {
+      console.error("WebSocket error:", error);
+    });
+  } catch (error) {
+    console.error("Error setting up WebSocket connection:", error);
+    ws.send(
+      `[ERROR] Failed to initialize prompts: ${(error as Error).message}`
+    );
+    ws.close();
+  }
 });
 
 server.listen(PORT, () => {
